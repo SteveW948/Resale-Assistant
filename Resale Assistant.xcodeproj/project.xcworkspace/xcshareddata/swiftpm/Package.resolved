@@ -1,0 +1,24 @@
+{
+  "originHash" : "ff06541b20ab2e6fe4451148a6ffb08a8c46651d933de2c9599c2846eeda53c4",
+  "pins" : [
+    {
+      "identity" : "mockimagepicker",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/yonat/MockImagePicker",
+      "state" : {
+        "revision" : "9ed8b2c2efa4adddffd1989f7f1a2ecf1e699dda",
+        "version" : "1.3.1"
+      }
+    },
+    {
+      "identity" : "sweeterswift",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/yonat/SweeterSwift",
+      "state" : {
+        "revision" : "c9e34c454ba4d5b7b6a81c766bb3337fb6e21dfc",
+        "version" : "1.2.6"
+      }
+    }
+  ],
+  "version" : 3
+}
