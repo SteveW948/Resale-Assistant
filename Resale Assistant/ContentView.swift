@@ -10,6 +10,7 @@ import PhotosUI
 import MockImagePicker
 import Vision
 import VisionKit
+import Observation
 
 #if targetEnvironment(simulator)
 import MockImagePicker
@@ -17,12 +18,14 @@ typealias UIImagePickerController = MockImagePicker
 typealias UIImagePickerControllerDelegate = MockImagePickerDelegate
 #endif
 
-class AppSettings: ObservableObject {
+@MainActor
+@Observable
+class AppSettings {
     private let sellerCodeKey = "sellerCode"
     private let storeNameKey = "storeName"
     private var isInitializing = true
     
-    @Published var sellerCode: String = "" {
+    var sellerCode: String = "" {
         didSet {
             if !isInitializing {
                 UserDefaults.standard.set(sellerCode, forKey: sellerCodeKey)
@@ -30,7 +33,7 @@ class AppSettings: ObservableObject {
         }
     }
     
-    @Published var storeName: String = "" {
+    var storeName: String = "" {
         didSet {
             if !isInitializing {
                 UserDefaults.standard.set(storeName, forKey: storeNameKey)
@@ -55,19 +58,126 @@ class AppSettings: ObservableObject {
     }
 }
 
+/// View model for caption generation. Vision work runs off the main thread to avoid dispatch queue assertions.
+@MainActor
+@Observable
+class CaptionViewModel {
+    var captionText: String = ""
+    var isLoading: Bool = false
+
+    func generateCaption(for image: UIImage) {
+        isLoading = true
+        captionText = ""
+
+        guard let cgImage = image.cgImage else {
+            captionText = "Error: Could not process image"
+            isLoading = false
+            return
+        }
+
+        let viewModel = self
+        Task.detached(priority: .userInitiated) {
+            Self.runVisionAnalysis(cgImage: cgImage) { result in
+                Task { @MainActor in
+                    viewModel.captionText = result
+                    viewModel.isLoading = false
+                }
+            }
+        }
+    }
+
+    func reset() {
+        captionText = ""
+        isLoading = false
+    }
+
+    /// Runs Vision on a background context and invokes the callback with the result string (callback can be called on any queue).
+    private nonisolated static func runVisionAnalysis(cgImage: CGImage, completion: @escaping (String) -> Void) {
+        let requestHandler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+
+        let classificationRequest = VNClassifyImageRequest { request, error in
+            if let error = error {
+                if error.localizedDescription.contains("espresso") {
+                    completion(Self.fallbackCaption(cgImage: cgImage))
+                } else {
+                    completion("Error analyzing image: \(error.localizedDescription)")
+                }
+                return
+            }
+
+            guard let results = request.results as? [VNClassificationObservation] else {
+                completion("No content detected in the image")
+                return
+            }
+
+            let topClassifications = results.prefix(3).compactMap { observation in
+                observation.identifier
+            }
+
+            if !topClassifications.isEmpty {
+                let mainObject = topClassifications.first ?? "object"
+                let confidence = results.first?.confidence ?? 0.0
+
+                if confidence > 0.7 {
+                    var text = "This image shows a \(mainObject). "
+                    if topClassifications.count > 1 {
+                        let additionalObjects = Array(topClassifications.dropFirst()).joined(separator: ", ")
+                        text += "Also visible: \(additionalObjects)."
+                    }
+                    if confidence > 0.9 {
+                        text += " The object is clearly visible and easily identifiable."
+                    } else if confidence > 0.8 {
+                        text += " The object is well-defined in the image."
+                    }
+                    completion(text)
+                } else {
+                    completion("The image appears to contain: " + topClassifications.joined(separator: ", "))
+                }
+            } else {
+                completion("No specific objects could be clearly identified in the image.")
+            }
+        }
+
+        do {
+            try requestHandler.perform([classificationRequest])
+        } catch {
+            if error.localizedDescription.contains("espresso") {
+                completion(Self.fallbackCaption(cgImage: cgImage))
+            } else {
+                completion("Error performing analysis: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private nonisolated static func fallbackCaption(cgImage: CGImage) -> String {
+        let width = cgImage.width
+        let height = cgImage.height
+        let colorSpace = cgImage.colorSpace?.name as String? ?? "Unknown"
+        let sizeKb = (width * height * 4) / 1024
+        return """
+        Image Analysis:
+        - Dimensions: \(width) x \(height) pixels
+        - Color space: \(colorSpace)
+        - File size: \(sizeKb) KB
+
+        Note: Advanced AI analysis is not available on this device.
+        Please try on a physical device for better results.
+        """
+    }
+}
+
 struct ContentView: View {
     @State private var showCamera = false
     @State private var capturedImage: UIImage?
     @State private var showImagePicker = false
     @State private var showPhotoReview = false
-    @State private var description: String = ""
-    @State private var isLoading: Bool = false
+    @State private var captionViewModel = CaptionViewModel()
     @State private var showOptions = false
-    @StateObject private var appSettings = AppSettings()
+    @State private var appSettings = AppSettings()
     @Environment(\.scenePhase) private var scenePhase
-    
+
     var body: some View {
-        NavigationView {
+        NavigationStack {
             VStack {
                 if let image = capturedImage {
                 Image(uiImage: image)
@@ -75,36 +185,37 @@ struct ContentView: View {
                     .scaledToFit()
                     .frame(maxHeight: 300)
                     .padding()
-                
-                if isLoading {
+
+                if captionViewModel.isLoading {
                     ProgressView("Generating caption...")
-                } else if !description.isEmpty {
+                } else if !captionViewModel.captionText.isEmpty {
                     Text("Caption:")
                         .font(.headline)
-                    TextEditor(text: $description)
+                    TextEditor(text: Binding(
+                        get: { captionViewModel.captionText },
+                        set: { captionViewModel.captionText = $0 }
+                    ))
                         .frame(height: 100)
                         .border(Color.gray, width: 1)
                         .padding()
                 }
-                
+
                 HStack {
                     Button("Retake") {
                         capturedImage = nil
-                        description = ""
-                        isLoading = false
+                        captionViewModel.reset()
                         showCamera = true
                     }
                     .buttonStyle(.borderedProminent)
-                    
+
                     Button("Generate Caption") {
-                        generateCaption(for: image)
+                        captionViewModel.generateCaption(for: image)
                     }
                     .buttonStyle(.borderedProminent)
-                    
+
                     Button("Cancel") {
                         capturedImage = nil
-                        description = ""
-                        isLoading = false
+                        captionViewModel.reset()
                     }
                     .buttonStyle(.bordered)
                 }
@@ -133,126 +244,14 @@ struct ContentView: View {
         }
         .onChange(of: scenePhase) { oldPhase, newPhase in
             if newPhase == .background || newPhase == .inactive {
-                // Ensure values are saved when app goes to background
                 appSettings.saveSettings()
             }
         }
     }
-    
-    private func generateCaption(for image: UIImage) {
-        isLoading = true
-        description = ""
-        
-        guard let cgImage = image.cgImage else {
-            description = "Error: Could not process image"
-            
-            isLoading = false
-            return
-        }
-        
-        // Try Vision framework first
-        analyzeWithVision(cgImage: cgImage)
-    }
-    
-    private func analyzeWithVision(cgImage: CGImage) {
-        let requestHandler = VNImageRequestHandler(cgImage: cgImage, options: [:])
-        
-        let classificationRequest = VNClassifyImageRequest { request, error in
-            DispatchQueue.main.async {
-                if let error = error {
-                    // If Vision fails, try alternative approach
-                    if error.localizedDescription.contains("espresso") {
-                        self.fallbackAnalysis(cgImage: cgImage)
-                    } else {
-                        self.description = "Error analyzing image: \(error.localizedDescription)"
-                        self.isLoading = false
-                    }
-                    return
-                }
-                
-                guard let results = request.results as? [VNClassificationObservation] else {
-                    self.description = "No content detected in the image"
-                    self.isLoading = false
-                    return
-                }
-                
-                let topClassifications = results.prefix(3).compactMap { observation in
-                    observation.identifier
-                }
-                
-                if !topClassifications.isEmpty {
-                    // Generate a more descriptive caption
-                    let mainObject = topClassifications.first ?? "object"
-                    let confidence = results.first?.confidence ?? 0.0
-                    
-                    if confidence > 0.7 {
-                        self.description = "This image shows a \(mainObject). "
-                        
-                        // Add additional context if multiple objects detected
-                        if topClassifications.count > 1 {
-                            let additionalObjects = Array(topClassifications.dropFirst()).joined(separator: ", ")
-                            self.description += "Also visible: \(additionalObjects)."
-                        }
-                        
-                        // Add descriptive context based on confidence
-                        if confidence > 0.9 {
-                            self.description += " The object is clearly visible and easily identifiable."
-                        } else if confidence > 0.8 {
-                            self.description += " The object is well-defined in the image."
-                        }
-                    } else {
-                        self.description = "The image appears to contain: " + topClassifications.joined(separator: ", ")
-                    }
-                } else {
-                    self.description = "No specific objects could be clearly identified in the image."
-                }
-                self.isLoading = false
-            }
-        }
-        
-        do {
-            try requestHandler.perform([classificationRequest])
-        } catch {
-            DispatchQueue.main.async {
-                if error.localizedDescription.contains("espresso") {
-                    self.fallbackAnalysis(cgImage: cgImage)
-                } else {
-                    self.description = "Error performing analysis: \(error.localizedDescription)"
-                    self.isLoading = false
-                }
-            }
-        }
-    }
-    
-    private func fallbackAnalysis(cgImage: CGImage) {
-        // Fallback: Provide basic image information
-        let width = cgImage.width
-        let height = cgImage.height
-        let colorSpace = cgImage.colorSpace?.name as String? ?? "Unknown"
-        
-        let imageInfo = """
-        Image Analysis:
-        - Dimensions: \(width) x \(height) pixels
-        - Color space: \(colorSpace)
-        - File size: \(estimateFileSize(width: width, height: height)) KB
-        
-        Note: Advanced AI analysis is not available on this device.
-        Please try on a physical device for better results.
-        """
-        
-        self.description = imageInfo
-        self.isLoading = false
-    }
-    
-    private func estimateFileSize(width: Int, height: Int) -> Int {
-        // Rough estimate: 4 bytes per pixel (RGBA)
-        let bytes = width * height * 4
-        return bytes / 1024
-    }
 }
 
 struct OptionsView: View {
-    @ObservedObject var appSettings: AppSettings
+    var appSettings: AppSettings
     @State private var sellerCode: String = ""
     @State private var storeName: String = ""
     @Environment(\.dismiss) private var dismiss
@@ -264,7 +263,7 @@ struct OptionsView: View {
     }
     
     var body: some View {
-        NavigationView {
+        NavigationStack {
             Form {
                 Section(header: Text("Store Information")) {
                     TextField("Seller Code", text: $sellerCode)
@@ -312,7 +311,7 @@ struct ImagePicker: UIViewControllerRepresentable {
         Coordinator(self)
     }
     
-    class Coordinator: NSObject, UINavigationControllerDelegate, UIImagePickerControllerDelegate {
+    class Coordinator: NSObject, UINavigationControllerDelegate, @MainActor UIImagePickerControllerDelegate {
         let parent: ImagePicker
         
         init(_ parent: ImagePicker) {
